@@ -11,8 +11,14 @@ function Show-Menu {
     Write-Host "3. Exchange Security Audit"
     Write-Host "4. Check for Red Team Persistence"
     Write-Host "5. Check for Security Updates"
-    Write-Host "6. Exit"
+    Write-Host "6. Harden SMB"
+    Write-Host "7. Harden DNS"
+    Write-Host "8. Exit"
+    Write-Host "9. Harden Firewall"
+
 }
+
+
 
 function Password-Hardening {
     $basePassword1 = Read-Host "Enter base password" -AsSecureString
@@ -151,18 +157,168 @@ function Apply-SecurityUpdates {
     Get-Command ExSetup | ForEach-Object { $_.FileVersionInfo }
 }
 
-# Main Menu Loop
-while ($true) {
-    Show-Menu
-    $choice = Read-Host "Enter choice number"
-    switch ($choice) {
-        '1' { Password-Hardening }
-        '2' { Disable-Services }
-        '3' { Audit-Exchange }
-        '4' { Check-Persistence }
-        '5' { Apply-SecurityUpdates }
-        '6' { break }
-        default { Write-Host "Invalid choice. Please select 1-6." -ForegroundColor Red }
+function Harden-SMB {
+    Write-Host "===== SMB HARDENING =====" -ForegroundColor Cyan
+
+    # 1. Disable SMBv1
+    Write-Host "--- Disabling SMBv1 ---"
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+    Disable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -NoRestart -ErrorAction SilentlyContinue
+    Write-Host "✔ SMBv1 disabled." -ForegroundColor Green
+
+    # 2. Block Anonymous Access
+    Write-Host "--- Blocking Anonymous Access ---"
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RestrictAnonymous /t REG_DWORD /d 1 /f
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RestrictAnonymousSAM /t REG_DWORD /d 1 /f
+    Write-Host "✔ Anonymous access restricted." -ForegroundColor Green
+
+    # 3. Audit Share Permissions
+    Write-Host "--- Auditing Share Permissions ---"
+    Get-SmbShare | Where-Object { $_.Name -ne "IPC$" } | ForEach-Object {
+        $acl = Get-SmbShareAccess -Name $_.Name
+        Write-Host "`n[$($_.Name)]" -ForegroundColor Yellow
+        $acl | Format-Table -AutoSize
     }
-    Read-Host "Press Enter to return to the menu"
+
+    # 4. Enforce SMB Signing
+    Write-Host "--- Enforcing SMB Signing ---"
+    Set-SmbServerConfiguration -RequireSecuritySignature $true -Force
+    Set-SmbClientConfiguration -RequireSecuritySignature $true -Force
+    Write-Host "✔ SMB signing enforced for both server and client." -ForegroundColor Green
+
+    # 5. Disable Guest Account
+    Write-Host "--- Disabling Guest Account ---"
+    Disable-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+    Write-Host "✔ Guest account disabled." -ForegroundColor Green
+
+    # 6. Block Outbound SMB (Ports 445 and 139)
+    Write-Host "--- Blocking Outbound SMB ---"
+    New-NetFirewallRule -DisplayName "Block Outbound SMB TCP 445" -Direction Outbound -Protocol TCP -RemotePort 445 -Action Block -Profile Any -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName "Block Outbound SMB TCP 139" -Direction Outbound -Protocol TCP -RemotePort 139 -Action Block -Profile Any -ErrorAction SilentlyContinue
+    Write-Host "✔ Outbound SMB blocked." -ForegroundColor Green
+
+    # 7. Password Hardening Reminder
+    Write-Host "--- Reminder: Ensure all SMB accounts use strong passwords." -ForegroundColor Yellow
+
+    # 8. Disable NetBIOS over TCP/IP (all interfaces)
+    Write-Host "--- Disabling NetBIOS over TCP/IP ---"
+    $nics = Get-WmiObject -Query "SELECT * FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = True"
+    foreach ($nic in $nics) {
+        $nic.SetTcpipNetbios(2) | Out-Null
+    }
+    Write-Host "✔ NetBIOS over TCP/IP disabled." -ForegroundColor Green
+
+    # 9. Disable LLMNR (via registry)
+    Write-Host "--- Disabling LLMNR ---"
+    New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient" -Force | Out-Null
+    Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient" -Name "EnableMulticast" -Value 0 -Force
+    Write-Host "✔ LLMNR disabled." -ForegroundColor Green
+
+    Write-Host "✅ SMB hardening complete." -ForegroundColor Cyan
 }
+
+function Harden-DNS {
+    Write-Host "===== DNS HARDENING =====" -ForegroundColor Cyan
+
+    # 1. Disable Zone Transfers
+    Write-Host "--- Disabling Zone Transfers ---"
+    $zones = Get-DnsServerZone -ErrorAction SilentlyContinue
+    foreach ($zone in $zones) {
+        Set-DnsServerPrimaryZone -Name $zone.ZoneName -ZoneTransferType None -ErrorAction SilentlyContinue
+        Write-Host "Zone transfers disabled for: $($zone.ZoneName)" -ForegroundColor Green
+    }
+
+    # 2. Disable Recursion (if this server is not forwarding/caching)
+    Write-Host "--- Disabling DNS Recursion ---"
+    Set-DnsServerRecursion -Enable $false -ErrorAction SilentlyContinue
+    Write-Host "Recursion disabled." -ForegroundColor Green
+
+    # 3. Enable DNS Logging and Diagnostics
+    Write-Host "--- Enabling DNS Diagnostic Logging ---"
+    Set-DnsServerDiagnostics -All $true -ErrorAction SilentlyContinue
+    Set-DnsServerDiagnostics -EventLogLevel 0xFFFF -ErrorAction SilentlyContinue
+    Write-Host "Full DNS diagnostics and event logging enabled." -ForegroundColor Green
+
+    # 4. Enable Response Rate Limiting to Mitigate DNS Amplification
+    Write-Host "--- Enabling DNS Response Rate Limiting ---"
+    Set-DnsServerResponseRateLimiting -ResponsesPerSec 5 -WindowSec 1 -ErrorAction SilentlyContinue
+    Write-Host "Response rate limiting enabled (5 responses/sec)." -ForegroundColor Green
+
+    Write-Host "✅ DNS hardening complete." -ForegroundColor Cyan
+}
+
+function Harden-Firewall {
+    Write-Host "===== FIREWALL HARDENING =====" -ForegroundColor Cyan
+
+    # 1. Enable Windows Defender Firewall on all network profiles
+    Write-Host "--- Enabling Windows Firewall for Domain, Private, and Public profiles ---"
+    Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+    Write-Host "✔ Firewall enabled." -ForegroundColor Green
+
+    # 2. Set default policy: block inbound traffic, allow outbound
+    Write-Host "--- Setting default policies (Block Inbound / Allow Outbound) ---"
+    Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Allow
+    Write-Host "✔ Default firewall policies applied." -ForegroundColor Green
+
+    # 3. Allow scored service ports (Exchange, DNS, AD, SMB)
+    $inboundRules = @(
+        @{Name="Allow DNS (TCP)"; Ports=53; Protocol="TCP"},
+        @{Name="Allow DNS (UDP)"; Ports=53; Protocol="UDP"},
+        @{Name="Allow SMB (445)"; Ports=445; Protocol="TCP"},
+        @{Name="Allow LDAP (389)"; Ports=389; Protocol="TCP"},
+        @{Name="Allow Secure LDAP (636)"; Ports=636; Protocol="TCP"},
+        @{Name="Allow Kerberos (TCP)"; Ports=88; Protocol="TCP"},
+        @{Name="Allow Kerberos (UDP)"; Ports=88; Protocol="UDP"},
+        @{Name="Allow Global Catalog (3268)"; Ports=3268; Protocol="TCP"},
+        @{Name="Allow GC over SSL (3269)"; Ports=3269; Protocol="TCP"},
+        @{Name="Allow SMTP (25)"; Ports=25; Protocol="TCP"},
+        @{Name="Allow SMTP Auth (587)"; Ports=587; Protocol="TCP"},
+        @{Name="Allow POP3 (110)"; Ports=110; Protocol="TCP"},
+        @{Name="Allow IMAP (143)"; Ports=143; Protocol="TCP"},
+        @{Name="Allow Exchange HTTPS (443)"; Ports=443; Protocol="TCP"}
+    )
+
+    foreach ($rule in $inboundRules) {
+        try {
+            New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -LocalPort $rule.Ports `
+                -Protocol $rule.Protocol -Action Allow -Profile Any -ErrorAction SilentlyContinue
+            Write-Host "✔ Allowed inbound port $($rule.Ports)/$($rule.Protocol) - $($rule.Name)" -ForegroundColor Green
+        } catch {
+            Write-Host "❌ Failed to allow $($rule.Name): $_" -ForegroundColor Red
+        }
+    }
+
+    # 4. Block outbound SMB (to prevent Red Team exfiltration/beaconing)
+    Write-Host "--- Blocking outbound SMB ---"
+    New-NetFirewallRule -DisplayName "Block Outbound SMB TCP 445" -Direction Outbound -Protocol TCP -RemotePort 445 -Action Block -Profile Any -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName "Block Outbound SMB TCP 139" -Direction Outbound -Protocol TCP -RemotePort 139 -Action Block -Profile Any -ErrorAction SilentlyContinue
+    Write-Host "✔ Outbound SMB blocked." -ForegroundColor Green
+
+    # 5. Enable logging for allowed and blocked connections
+    Write-Host "--- Enabling firewall logging ---"
+    Set-NetFirewallProfile -Profile Domain,Private,Public `
+        -LogFileName "%systemroot%\system32\LogFiles\Firewall\pfirewall.log" `
+        -LogMaxSizeKilobytes 32767 -LogAllowed True -LogBlocked True
+    Write-Host "✔ Logging enabled for allowed and blocked connections." -ForegroundColor Green
+
+    Write-Host "✅ Firewall hardening complete." -ForegroundColor Cyan
+}
+
+
+
+
+# Main Menu Loop
+switch ($choice) {
+    '1' { Password-Hardening }
+    '2' { Disable-Services }
+    '3' { Audit-Exchange }
+    '4' { Check-Persistence }
+    '5' { Apply-SecurityUpdates }
+    '6' { Harden-SMB }
+    '7' { Harden-DNS }
+    '8' { Harden-Firewall }
+    '9' { break }
+
+    default { Write-Host "Invalid choice. Please select 1-9." -ForegroundColor Red }
+}
+
